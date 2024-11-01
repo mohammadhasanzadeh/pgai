@@ -7,7 +7,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 HELP = """Available targets:
 - help             displays this message and exits
 - build-install    runs build followed by install
@@ -90,13 +89,55 @@ def idempotent_sql_files() -> list[Path]:
     return paths
 
 
+def parse_feature_flag(path: Path) -> str | None:
+    with path.open(mode="rt", encoding="utf-8") as f:
+        line = f.readline()
+        if not line.startswith("--FEATURE-FLAG: "):
+            return None
+        ff = line.removeprefix("--FEATURE-FLAG: ").strip()
+        pattern = r"^[a-zA-Z]\w*$"
+        if re.fullmatch(pattern, ff) is None:
+            print(
+                f"feature flag {ff} in {path.name} does not match the pattern {pattern}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return ff
+
+
+def check_sql_file_name(path: Path) -> None:
+    pattern = r"^\d\d\d-[a-z][a-z_-]*\.sql$"
+    if re.fullmatch(pattern, path.name) is None:
+        print(
+            f"{path} file name does not match the pattern {pattern}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def check_idempotent_sql_files(paths: list[Path]) -> None:
     prev = 0
     for path in paths:
+        check_sql_file_name(path)
+        if path.name == "999-privileges.sql":
+            break
         this = int(path.name[0:3])
-        if this != 999 and this != prev + 1:
+        if this != 900 and this != prev + 1:
             print(
                 f"idempotent sql files must be strictly ordered. this: {this} prev: {prev}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        ff = parse_feature_flag(path)
+        if this < 900 and ff:
+            print(
+                f"idempotent sql files under 900 must be NOT gated by a feature flag: {path.name}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if this >= 900 and not ff:
+            print(
+                f"idempotent sql files over 899 must be gated by a feature flag: {path.name}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -116,10 +157,24 @@ def incremental_sql_files() -> list[Path]:
 def check_incremental_sql_files(paths: list[Path]) -> None:
     prev = 0
     for path in paths:
+        check_sql_file_name(path)
         this = int(path.name[0:3])
-        if this != prev + 1:
+        if this != 900 and this != prev + 1:
             print(
                 f"incremental sql files must be strictly ordered. this: {this} prev: {prev}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        ff = parse_feature_flag(path)
+        if this < 900 and ff:
+            print(
+                f"incremental sql files under 900 must be NOT gated by a feature flag: {path.name}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if this >= 900 and not ff:
+            print(
+                f"incremental sql files over 899 must be gated by a feature flag: {path.name}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -151,13 +206,22 @@ def sql_migration_file() -> Path:
 
 def build_incremental_sql_file(input_file: Path) -> str:
     template = sql_migration_file().read_text()
+    feature_flag_guc = feature_flag_to_guc(parse_feature_flag(input_file))
+    feature_flag_guc = feature_flag_guc if feature_flag_guc else "null"
     migration_name = input_file.name
     migration_body = input_file.read_text()
     version = this_version()
     migration_body = migration_body.replace("@extversion@", version)
     return template.format(
-        migration_name=migration_name, migration_body=migration_body, version=version
+        migration_name=migration_name,
+        migration_body=migration_body,
+        version=version,
+        feature_flag_guc=feature_flag_guc,
     )
+
+
+def sql_gated_file() -> Path:
+    return sql_dir() / "gated.sql"
 
 
 def build_idempotent_sql_file(input_file: Path) -> str:
@@ -181,13 +245,48 @@ def build_idempotent_sql_file(input_file: Path) -> str:
     inject = "".join(inject.splitlines(keepends=True)[1:-1])
     code = input_file.read_text()
     code = code.replace("@extversion@", this_version())
-    return code.replace(
+    code = code.replace(
         """    #ADD-PYTHON-LIB-DIR\n""", inject
     )  # leading 4 spaces is intentional
+    feature_flag_guc = feature_flag_to_guc(parse_feature_flag(input_file))
+    if feature_flag_guc:
+        template = sql_gated_file().read_text()
+        code = template.format(feature_flag_guc=feature_flag_guc, code=code)
+    return code
 
 
 def sql_head_file() -> Path:
     return sql_dir() / "head.sql"
+
+
+def feature_flag_to_guc(ff: str | None) -> str | None:
+    return f"'ai.enable_feature_flag_{ff}'" if ff else None
+
+
+def feature_flag_gucs() -> set[str]:
+    feature_flags = set()
+    for path in incremental_sql_files():
+        ff = parse_feature_flag(path)
+        if ff:
+            feature_flags.add(feature_flag_to_guc(ff))
+    for path in idempotent_sql_files():
+        ff = parse_feature_flag(path)
+        if ff:
+            feature_flags.add(feature_flag_to_guc(ff))
+    return feature_flags
+
+
+def sql_warning_file() -> Path:
+    return sql_dir() / "warning.sql"
+
+
+def build_feature_flag_warning() -> str:
+    gucs = feature_flag_gucs()
+    if len(gucs) == 0:
+        return ""
+    gucs = ", ".join(gucs)
+    template = sql_warning_file().read_text()
+    return template.format(feature_flag_gucs=gucs)
 
 
 def build_sql() -> None:
@@ -196,21 +295,23 @@ def build_sql() -> None:
     osf = output_sql_file()
     osf.unlink(missing_ok=True)
     with osf.open("w") as wf:
-        wf.write(f"{hr}\n-- {this_version()}\n\n\n")
+        wf.write(f"{hr}\n-- {this_version()}\n\n")
         wf.write(sql_head_file().read_text())
-        wf.write("\n\n\n")
+        wf.write("\n\n")
+        wf.write(build_feature_flag_warning())
+        wf.write("\n\n")
         files = incremental_sql_files()
         check_incremental_sql_files(files)
         for inc_file in files:
             code = build_incremental_sql_file(inc_file)
             wf.write(code)
-            wf.write("\n\n\n")
+            wf.write("\n\n")
         files = idempotent_sql_files()
         check_idempotent_sql_files(files)
         for idm_file in files:
             wf.write(f"{hr}\n-- {idm_file.name}\n")
             wf.write(build_idempotent_sql_file(idm_file))
-            wf.write("\n\n\n")
+            wf.write("\n\n")
         wf.flush()
         wf.close()
     for prior_version in prior_versions():
